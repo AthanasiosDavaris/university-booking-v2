@@ -2,28 +2,32 @@
 
 namespace App\Models;
 
-// use Illuminate\Contracts\Auth\MustVerifyEmail;
-use Database\Factories\UserFactory;
-use Illuminate\Database\Eloquent\Attributes\Fillable;
-use Illuminate\Database\Eloquent\Attributes\Hidden;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 use Laravel\Sanctum\HasApiTokens;
+use Illuminate\Database\Eloquent\Casts\Attribute;
 
-#[Fillable(['name', 'lastname','email', 'password', 'role_id'])]
-#[Hidden(['password', 'remember_token'])]
 class User extends Authenticatable
 {
-    /** @use HasFactory<UserFactory> */
-    use HasApiTokens ,HasFactory, Notifiable;
+    use HasApiTokens, HasFactory, Notifiable
 
-    /**
-     * Get the attributes that should be cast.
-     *
-     * @return array<string, string>
-     */
+    protected $fillable = [
+        'first_name',
+        'last_name',
+        'email',
+        'password',
+        'role_id',
+        'department_id',
+    ];
+
+    protected $hidden = [
+        'password',
+        'remember_token',
+    ];
+
     protected function casts(): array
     {
         return [
@@ -32,19 +36,41 @@ class User extends Authenticatable
         ];
     }
 
-    /**
-     * Relationship: A User belongs to a Role
-     */
+    protected function name(): Attribute
+    {
+        return Attribute::make(
+            get: fn () => "{$this->first_name} {$this->last_name}",
+        );
+    }
+
     public function role(): BelongsTo
     {
         return $this->belongsTo(Role::class);
     }
 
-    /**
-     * Helper method to check if the user has a specific role.
-     */
-    public function hasRole(string $roleName): bool
+    public function department(): BelongsTo
     {
-        return $this->role !== null &&$this->role->title === $roleName;
+        return $this->belongsTo(Department::class);
     }
+
+    public function reservations(): HasMany
+    {
+        return $this->hasMany(Reservation::class);
+    }
+
+    public function courseSessions(): HasMany
+    {
+        return $this->hasMany(CourseSession::class, 'professor_id');
+    }
+
+    public function availabilities(): HasMany
+    {
+        return $this->hasMany(ProfessorAvailability::class, 'professor_id');
+    }
+
+    // RBAC Helpers
+    public function isAdmin(): bool { return $this->role?->name === 'admin'; }
+    public function isSecretary(): bool { return $this->role?->name === 'secretary'; }
+    public function isProfessor(): bool { return $this->role?->name === 'professor'; }
+    public function isStudent(): bool { return $this->role?->name === 'student'; }
 }
