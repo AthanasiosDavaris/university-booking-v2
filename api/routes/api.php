@@ -1,33 +1,30 @@
 <?php
 
 use Illuminate\Support\Facades\Route;
-use App\Http\Controllers\AuthController;
-use App\Http\Controllers\BuildingController;
-use App\Http\Controllers\RoomController;
-use App\Http\Controllers\ReservationController;
+use App\Http\Controllers\Api\AuthController;
 
 // Public Routes
-Route::post('/login', [AuthController::class, 'login']);
+Route::post('/auth/login', [AuthController::class, 'login']);
 
-// Protected Routes (require Sanctum authentication)
+// Protected Routes (requires valid Sanctum Token)
 Route::middleware('auth:sanctum')->group(function () {
-    // Auth
-    Route::post('/logout', [AuthController::class, 'logout']);
-    Route::get('/me', [AuthController::class, 'me']);
+    // Auth management
+    Route::post('/auth/logout', [AuthController::class, 'logout']);
+    Route::get('/auth/me', [AuthController::class, 'me']);
 
-    // Buildings (Read-only for authenticated users)
-    Route::get('/buildings', [BuildingController::class, 'index']);
-    Route::get('/buildings/{building}',[BuildingController::class, 'show']);
+    // RBAC test routes
 
-    // Rooms (Read-only for authenticated users)
-    Route::get('/rooms', [RoomController::class, 'index']);
-    Route::get('/rooms/{room}', [RoomController::class, 'show']);
+    // Only Admins
+    Route::middleware('role:admin')->group(function () {
+        Route::get('/admin/dashboard', function () {
+            return response()->json(['message' => 'Welcome to the Admin Dashboard']);
+        });
+    });
 
-    // Reservations
-    Route::post('/reservations',[ReservationController::class, 'store']);
-});
-
-// Health check
-Route::get('/health', function () {
-    return response()->json(['status' => 'Laravel API is running']);
+    // Admins and Secreatries
+    Route::middleware('role:admin,secretary')->group(function () {
+        Route::get('/secretary/overview', function () {
+            return response()->json(['message' => 'Welcome to the Secretary Overview']);
+        });
+    });
 });
