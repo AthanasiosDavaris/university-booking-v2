@@ -3,9 +3,9 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Http\Requests\CheckAvailabilityRequest;
-use App\Http\Requests\StoreReservationRequest;
-use App\Http\Requests\UpdateReservationStatusRequest;
+use App\Http\Requests\Reservation\CheckAvailabilityRequest;
+use App\Http\Requests\Reservation\StoreReservationRequest;
+use App\Http\Requests\Reservation\UpdateReservationStatusRequest;
 use App\Models\Room;
 use App\Models\Reservation;
 use Illuminate\Database\QueryException;
@@ -16,26 +16,26 @@ class BookingController extends Controller
 {
     /**
      * GET /api/rooms/availability
-     * Uses Allen's Interval Algebra to detect temporal overlaps.
+     * Uses temporal overlap algebra: (starts_at < requested_end) AND (ends_at > requested_start)
      */
     public function availability(CheckAvailabilityRequest $request): JsonResponse
     {
         $validated = $request->validated();
-        $query = Room::query();
+        $query = Room::query()->with('building');
 
-        // Apply physical constraints dynamically
-        $query->when($request->filled('capacity'), fn($q) => $q->where('capacity', '>=', $validated['capacity']))
-              ->when($request->filled('exam_capacity'), fn($q) => $q->where('exam_capacity', '>=', $validated['exam_capacity']))
-              ->when($request->filled('room_type'), fn($q) => $q->where('type', $validated['room_type']))
-              ->when($request->filled('is_accessible'), fn($q) => $q->where('is_accessible', $validated['is_accessible']))
-              ->when($request->filled('has_hvac'), fn($q) => $q->where('has_hvac', $validated['has_hvac']));
+        // Physical constraints filter
+        $query->when(isset($validated['capacity']), fn($q) => $q->where('capacity', '>=', $validated['capacity']))
+              ->when(isset($validated['exam_capacity']), fn($q) => $q->where('exam_capacity', '>=', $validated['exam_capacity']))
+              ->when(isset($validated['room_type']), fn($q) => $q->where('type', $validated['room_type']))
+              ->when(isset($validated['is_accessible']), fn($q) => $q->where('is_wheelchair_accessible', $validated['is_accessible']))
+              ->when(isset($validated['has_projector']), fn($q) => $q->where('has_projector', $validated['has_projector']))
+              ->when(isset($validated['has_ac']), fn($q) => $q->where('has_ac', $validated['has_ac']));
 
-        //  Apply temporal constraints (Exclude rooms with overlapping bookings)
-        //  Logic: (ExistingStart < NewEnd) AND (ExistingEnd > NewStart)
+        // Exclude rooms with overlapping confirmed or pending reservations
         $query->whereDoesntHave('reservations', function ($q) use ($validated) {
-            $q->whereIn('status', ['approved', 'pending'])
-              ->where('start_time', '<', $validated['end_time'])
-              ->where('end_time', '>', $validated['start_time']);
+            $q->whereIn('status', ['confirmed', 'pending'])
+              ->where('starts_at', '<', $validated['ends_at'])
+              ->where('ends_at', '>', $validated['starts_at']);
         });
 
         return response()->json($query->get());
@@ -43,34 +43,47 @@ class BookingController extends Controller
 
     /**
      * POST /api/reservations
-     * Implements dynamic concurrency control for thesis benchmarking.
+     * Supports: pessimistic | optimistic | none (for thesis benchmarks)
      */
     public function store(StoreReservationRequest $request): JsonResponse
     {
-        $strategy = $request->header('X-Lock-Strategy', 'pessimistic');
+        $strategy  = $request->header('X-Lock-Strategy', 'pessimistic');
         $validated = $request->validated();
-        $userId = $request->user()->id;
+        $user      = $request->user();
+
+        // Admins, secretaries and professors default to confirmed; students default to pending
+        $initialStatus = $validated['status'] ?? (in_array($user->role?->name, ['admin', 'secretary', 'professor']) ? 'confirmed' : 'pending');
 
         try {
-            // Route to the appropriate locking strategy
             $reservation = match ($strategy) {
-                'pessimistic' => $this->storePessimistic($validated, $userId),
-                'optimistic'  => $this->storeOptimistic($validated, $userId),
-                'none'        => $this->storeNone($validated, $userId),
+                'pessimistic' => $this->storePessimistic($validated, $user->id, $initialStatus),
+                'optimistic'  => $this->storeOptimistic($validated, $user->id, $initialStatus),
+                'none'        => $this->storeNone($validated, $user->id, $initialStatus),
                 default       => abort(400, 'Invalid X-Lock-Strategy header.'),
             };
 
-            return response()->json($reservation, 201);
+            return response()->json([
+                'message'       => 'Reservation created successfully.',
+                'strategy_used' => $strategy,
+                'reservation'   => $reservation
+            ], 201);
+
         } catch (QueryException $e) {
+            $sqlState = $e->errorInfo[0] ?? $e->getCode();
+            
             // SQLSTATE 23P01: exclusion_violation
-            if ($e->getCode() === '23P01') {
+            if ($sqlState === '23P01' || $e->getCode() === '23P01') {
                 return response()->json([
-                    'error' => 'Database Constraint Violation',
-                    'message' => 'Race condition intercepted by PostgreSQL GiST exclusion constraint.',
+                    'error'         => 'Database Constraint Violation',
+                    'message'       => 'Race condition intercepted by PostgreSQL GiST exclusion constraint.',
                     'strategy_used' => $strategy
                 ], 409);
             }
-            throw $e;
+            
+            return response()->json([
+                'error'   => 'Database Error',
+                'message' => 'Concurrent write conflict occurred.'
+            ], 409);
         }
     }
 
@@ -79,58 +92,83 @@ class BookingController extends Controller
      */
     public function updateStatus(UpdateReservationStatusRequest $request, Reservation $reservation): JsonResponse
     {
-        $reservation->update($request->validated());
+        $validated = $request->validated();
 
-        return response()->json($reservation);
+        $reservation->update([
+            'status'           => $validated['status'],
+            'rejection_reason' => $validated['rejection_reason'] ?? null,
+            'reviewed_by_id'   => $request->user()->id,
+            'reviewed_at'      => now(),
+        ]);
+
+        return response()->json([
+            'message'     => 'Reservation status updated successfully.',
+            'reservation' => $reservation
+        ]);
     }
 
     /**
-     * SERIALIZED: Locks the parent Room row. Concurrent requests for the SAME room 
-     * will queue at the database level until this transaction commits/rolls back.
+     * SERIALIZED: Row-level lock via SELECT ... FOR UPDATE
      */
-    private function storePessimistic(array $data, string $userId): Reservation
+    private function storePessimistic(array $data, int $userId, string $status): Reservation
     {
-        return DB::transaction(function () use ($data, $userId) {
+        return DB::transaction(function () use ($data, $userId, $status) {
+            // Exclusive row lock on the room
             $room = Room::where('id', $data['room_id'])->lockForUpdate()->firstOrFail();
 
-            if ($this->hasOverlap($room->id, $data['start_time'], $data['end_time'])) {
-                abort(409, 'Room is already booked for the requested time slot.');
+            if ($this->hasOverlap($room->id, $data['starts_at'], $data['ends_at'])) {
+                abort(409, 'The room is already booked for the requested time slot.');
             }
 
-            return Reservation::create([...$data, 'user_id' => $userId, 'status' => 'pending']);
+            return $this->createReservationRecord($data, $userId, $status);
         });
     }
 
     /**
-     * NON-SERIALIZED: Checks app-level state, then attempts insert. 
-     * Highly susceptible to race conditions under load.
+     * NON-SERIALIZED: Check and insert without DB lock
      */
-    private function storeOptimistic(array $data, string $userId): Reservation
+    private function storeOptimistic(array $data, int $userId, string $status): Reservation
     {
-        if ($this->hasOverlap($data['room_id'], $data['start_time'], $data['end_time'])) {
-            abort(409, 'Room is already booked for the requested time slot.');
+        if ($this->hasOverlap($data['room_id'], $data['starts_at'], $data['ends_at'])) {
+            abort(409, 'The room is already booked for the requested time slot.');
         }
 
-        return Reservation::create([...$data, 'user_id' => $userId, 'status' => 'pending']);
+        return $this->createReservationRecord($data, $userId, $status);
     }
 
     /**
-     * BLIND INSERT: Relies 100% on the PostgreSQL GiST constraint.
+     * BLIND INSERT: Relies directly on the PostgreSQL GiST exclusion constraint
      */
-    private function storeNone(array $data, string $userId): Reservation
+    private function storeNone(array $data, int $userId, string $status): Reservation
     {
-        return Reservation::create([...$data, 'user_id' => $userId, 'status' => 'pending']);
+        return $this->createReservationRecord($data, $userId, $status);
+    }
+
+    /**
+     * Helper to persist reservation with purpose support
+     */
+    private function createReservationRecord(array $data, int $userId, string $status): Reservation
+    {
+        return Reservation::create([
+            'room_id'   => $data['room_id'],
+            'user_id'   => $userId,
+            'title'     => $data['title'],
+            'purpose'   => $data['purpose'] ?? 'lecture',
+            'starts_at' => $data['starts_at'],
+            'ends_at'   => $data['ends_at'],
+            'status'    => $status,
+        ]);
     }
 
     /**
      * Helper for temporal overlap check
      */
-    private function hasOverlap(string $roomId, string $startTime, string $endTime): bool
+    private function hasOverlap(int $roomId, string $startsAt, string $endsAt): bool
     {
         return Reservation::where('room_id', $roomId)
-            ->whereIn('status', ['approved', 'pending'])
-            ->where('start_time', '<', $endTime)
-            ->where('end_time', '>', $startTime)
+            ->whereIn('status', ['confirmed', 'pending'])
+            ->where('starts_at', '<', $endsAt)
+            ->where('ends_at', '>', $startsAt)
             ->exists();
     }
 }

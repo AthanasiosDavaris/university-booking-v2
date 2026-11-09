@@ -9,16 +9,24 @@ use Illuminate\Database\Eloquent\Builder;
 class Reservation extends Model
 {
     protected $fillable = [
-        'title', 'room_id', 'user_id', 'course_session_id', 
-        'starts_at', 'ends_at', 'status', 'rejection_reason', 
-        'reviewed_by_id', 'reviewed_at'
+        'title', 
+        'purpose', // <-- Προστέθηκε εδώ
+        'room_id', 
+        'user_id', 
+        'course_session_id', 
+        'starts_at', 
+        'ends_at', 
+        'status', 
+        'rejection_reason', 
+        'reviewed_by_id', 
+        'reviewed_at'
     ];
 
     protected function casts(): array
     {
         return [
-            'starts_at' => 'datetime',
-            'ends_at' => 'datetime',
+            'starts_at'   => 'datetime',
+            'ends_at'     => 'datetime',
             'reviewed_at' => 'datetime',
         ];
     }
@@ -43,7 +51,8 @@ class Reservation extends Model
         return $this->belongsTo(User::class, 'reviewed_by_id');
     }
 
-    // Scopes
+    // --- Scopes ---
+
     public function scopeConfirmed(Builder $query): Builder
     {
         return $query->where('status', 'confirmed');
